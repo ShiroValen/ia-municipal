@@ -10,115 +10,184 @@ EQUIPO:
   - Comunicaciones: Choucha
 ARCHIVO: motor_ia.py
 DESCRIPCIÓN:
-  Motor de Inteligencia Artificial y reglas de negocio para la priorización
-  automática de reportes de incidencias municipales. Normaliza factores,
-  aplica ponderaciones multicriterio y ejecuta las reglas de negocio RN-01 a RN-08.
+  Motor de priorización basado en ponderaciones multicriterio y reglas de
+  negocio RN-01 a RN-08 para reportes de incidencias municipales.
 =============================================================================
 """
 
 import copy
-from typing import List, Dict, Any, Tuple
+from typing import Any, Dict, List, Tuple
 
 
 # =============================================================================
 # CONSTANTES DE PONDERACIÓN Y NORMALIZACIÓN
 # =============================================================================
-PESO_GRAVEDAD = 0.35   # 35% Gravedad del incidente (impacto en seguridad/salud)
-PESO_POBLACION = 0.30  # 30% Población directamente afectada
-PESO_TIEMPO = 0.20     # 20% Días acumulados sin atención
-PESO_RECURSOS = 0.15   # 15% Recursos necesarios (factibilidad de ejecución)
+PESO_GRAVEDAD = 0.35
+PESO_POBLACION = 0.30
+PESO_TIEMPO = 0.20
+PESO_RECURSOS = 0.15
 
-# Escalas de normalización
 MAX_GRAVEDAD = 5.0
 MAX_POBLACION = 5000.0
 MAX_TIEMPO_DIAS = 60.0
 
-# Valoración de recursos (menor recurso = mayor facilidad y retorno rápido)
 MAPA_RECURSOS = {
-    "Bajo": 100.0,   # Rápida solución, bajo costo operativo (quick-win)
-    "Medio": 60.0,   # Requiere cuadrilla estándar y presupuesto medio
-    "Alto": 30.0     # Requiere maquinaria pesada, licitación o presupuesto alto
+    "bajo": 100.0,
+    "medio": 60.0,
+    "alto": 30.0,
 }
 
 
+# =============================================================================
+# FUNCIONES AUXILIARES Y VALIDACIÓN
+# =============================================================================
+def _texto(valor: Any, predeterminado: str = "") -> str:
+    """Convierte un valor en texto seguro, quitando espacios externos."""
+    if valor is None:
+        return predeterminado
+    return str(valor).strip()
+
+
+def _numero(
+    valor: Any,
+    predeterminado: float,
+    minimo: float = 0.0,
+    maximo: float = float("inf"),
+) -> float:
+    """
+    Convierte un valor a número y limita su rango.
+    Si el valor no es numérico o no es finito, usa el valor predeterminado.
+    """
+    try:
+        numero = float(valor)
+    except (TypeError, ValueError):
+        numero = predeterminado
+
+    # Evita NaN e infinitos sin depender de comparaciones ambiguas con NaN.
+    if numero != numero or numero in (float("inf"), float("-inf")):
+        numero = predeterminado
+
+    return min(maximo, max(minimo, numero))
+
+
+def _estado_resuelto(reporte: Dict[str, Any]) -> bool:
+    """Compara el estado sin distinguir mayúsculas ni espacios exteriores."""
+    return _texto(reporte.get("estado")).casefold() == "resuelto"
+
+
+def _clave_zona(reporte: Dict[str, Any]) -> Tuple[str, str]:
+    return (
+        _texto(reporte.get("distrito")),
+        _texto(reporte.get("zona")),
+    )
+
+
+def _clave_duplicado(reporte: Dict[str, Any]) -> Tuple[str, str, str]:
+    return (
+        _texto(reporte.get("distrito")),
+        _texto(reporte.get("zona")),
+        _texto(reporte.get("categoria")),
+    )
+
+
+# =============================================================================
+# NORMALIZACIÓN DE FACTORES
+# =============================================================================
 def normalizar_factores(reporte: Dict[str, Any]) -> Dict[str, float]:
     """
-    Normaliza los cuatro factores clave a una escala uniforme de 0 a 100.
+    Normaliza gravedad, población, tiempo y recursos a una escala de 0 a 100.
+    Los datos ausentes o inválidos reciben valores predeterminados seguros.
     """
-    gravedad = float(reporte.get("gravedad", 1))
-    poblacion = float(reporte.get("poblacion_afectada", 10))
-    tiempo = float(reporte.get("tiempo_sin_resolver", 1))
-    recursos_str = reporte.get("recursos_requeridos", "Medio")
+    gravedad = _numero(reporte.get("gravedad", 1), 1.0, 0.0, MAX_GRAVEDAD)
+    poblacion = _numero(
+        reporte.get("poblacion_afectada", 10), 10.0, 0.0, MAX_POBLACION
+    )
+    tiempo = _numero(
+        reporte.get("tiempo_sin_resolver", 1), 1.0, 0.0, MAX_TIEMPO_DIAS
+    )
+    recursos = _texto(reporte.get("recursos_requeridos", "Medio"), "Medio").casefold()
 
-    # Normalización lineal acotada
-    norm_gravedad = min(100.0, max(0.0, (gravedad / MAX_GRAVEDAD) * 100.0))
-    norm_poblacion = min(100.0, max(0.0, (poblacion / MAX_POBLACION) * 100.0))
-    norm_tiempo = min(100.0, max(0.0, (tiempo / MAX_TIEMPO_DIAS) * 100.0))
-    norm_recursos = MAPA_RECURSOS.get(recursos_str, 60.0)
+    norm_gravedad = (gravedad / MAX_GRAVEDAD) * 100.0
+    norm_poblacion = (poblacion / MAX_POBLACION) * 100.0
+    norm_tiempo = (tiempo / MAX_TIEMPO_DIAS) * 100.0
+    norm_recursos = MAPA_RECURSOS.get(recursos, MAPA_RECURSOS["medio"])
 
     return {
         "norm_gravedad": round(norm_gravedad, 2),
         "norm_poblacion": round(norm_poblacion, 2),
         "norm_tiempo": round(norm_tiempo, 2),
-        "norm_recursos": round(norm_recursos, 2)
+        "norm_recursos": round(norm_recursos, 2),
     }
 
 
-def consolidar_duplicados(reportes: List[Dict[str, Any]]) -> Dict[Tuple[str, str, str], List[int]]:
+# =============================================================================
+# REGLAS CONTEXTUALES
+# =============================================================================
+def consolidar_duplicados(
+    reportes: List[Dict[str, Any]],
+) -> Dict[Tuple[str, str, str], List[Any]]:
     """
-    Función que analiza y agrupa reportes por coincidencia de (distrito, zona, categoría).
-    Permite detectar concentración de reclamos ciudadanos sobre una misma problemática.
-    Retorna un diccionario con la clave (distrito, zona, categoría) y lista de IDs asociados.
+    Agrupa reportes activos por distrito, zona y categoría.
+    Esta coincidencia indica similitud por esos campos; no confirma por sí sola
+    que dos reportes describan exactamente el mismo incidente.
     """
-    grupos: Dict[Tuple[str, str, str], List[int]] = {}
-    for rep in reportes:
-        clave = (
-            rep.get("distrito", "").strip(),
-            rep.get("zona", "").strip(),
-            rep.get("categoria", "").strip()
-        )
-        if clave not in grupos:
-            grupos[clave] = []
-        grupos[clave].append(rep.get("id"))
+    grupos: Dict[Tuple[str, str, str], List[Any]] = {}
+
+    for reporte in reportes:
+        if _estado_resuelto(reporte):
+            continue
+
+        clave = _clave_duplicado(reporte)
+        grupos.setdefault(clave, []).append(reporte.get("id"))
+
     return grupos
 
 
-def contar_concentracion_zonal(reportes: List[Dict[str, Any]]) -> Dict[Tuple[str, str], int]:
-    """
-    Calcula cuántos reportes activos existen por combinación de (distrito, zona).
-    """
+def contar_concentracion_zonal(
+    reportes: List[Dict[str, Any]],
+) -> Dict[Tuple[str, str], int]:
+    """Cuenta reportes activos por distrito y zona."""
     conteo: Dict[Tuple[str, str], int] = {}
-    for rep in reportes:
-        if rep.get("estado") != "Resuelto":
-            clave = (rep.get("distrito", "").strip(), rep.get("zona", "").strip())
+
+    for reporte in reportes:
+        if not _estado_resuelto(reporte):
+            clave = _clave_zona(reporte)
             conteo[clave] = conteo.get(clave, 0) + 1
+
     return conteo
 
 
+# =============================================================================
+# CÁLCULO DEL RANKING
+# =============================================================================
 def calcular_ranking(reportes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Calcula el ranking de priorización inteligente para la lista de reportes:
-    1. Normaliza los 4 factores (gravedad, población, tiempo, recursos) a escala 0-100.
-    2. Aplica la ponderación multicriterio: 35%, 30%, 20%, 15%.
-    3. Aplica las 8 reglas de negocio (RN-01 a RN-08).
-    4. Acota el puntaje a [0, 100] y clasifica en Crítica, Alta, Media, Baja.
-    5. Ordena de mayor a menor puntaje.
+    Calcula el ranking de priorización:
+    1. Normaliza los cuatro factores.
+    2. Aplica ponderaciones de 35 %, 30 %, 20 % y 15 %.
+    3. Ejecuta las reglas de negocio RN-01 a RN-08.
+    4. Limita el puntaje activo al intervalo [0, 100].
+    5. Clasifica y ordena los reportes activos antes que los resueltos.
     """
     if not reportes:
         return []
 
-    # Pre-cálculo para reglas contextuales
     conteo_zonal = contar_concentracion_zonal(reportes)
     grupos_duplicados = consolidar_duplicados(reportes)
-
-    reportes_procesados = []
+    reportes_procesados: List[Dict[str, Any]] = []
 
     for item in reportes:
         rep = copy.deepcopy(item)
         factores = normalizar_factores(rep)
         rep.update(factores)
 
-        # Cálculo de puntaje base ponderado
+        gravedad = _numero(rep.get("gravedad", 1), 1.0, 0.0, MAX_GRAVEDAD)
+        poblacion = _numero(rep.get("poblacion_afectada", 0), 0.0)
+        dias = _numero(rep.get("tiempo_sin_resolver", 0), 0.0)
+        recursos = _texto(rep.get("recursos_requeridos", "Medio"), "Medio").casefold()
+        categoria = _texto(rep.get("categoria"))
+        es_resuelto = _estado_resuelto(rep)
+
         p_gravedad = factores["norm_gravedad"] * PESO_GRAVEDAD
         p_poblacion = factores["norm_poblacion"] * PESO_POBLACION
         p_tiempo = factores["norm_tiempo"] * PESO_TIEMPO
@@ -126,46 +195,44 @@ def calcular_ranking(reportes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         puntaje_base = p_gravedad + p_poblacion + p_tiempo + p_recursos
         puntaje_final = puntaje_base
-        reglas_aplicadas = []
+        reglas_aplicadas: List[Dict[str, str]] = []
 
-        # =====================================================================
-        # APLICACIÓN DE REGLAS DE NEGOCIO (RN-01 a RN-08)
-        # =====================================================================
-        clave_zona = (rep.get("distrito", "").strip(), rep.get("zona", "").strip())
-        clave_dup = (
-            rep.get("distrito", "").strip(),
-            rep.get("zona", "").strip(),
-            rep.get("categoria", "").strip()
-        )
-
-        es_resuelto = rep.get("estado") == "Resuelto"
+        clave_zona = _clave_zona(rep)
+        clave_dup = _clave_duplicado(rep)
 
         if not es_resuelto:
-            # RN-01: Concentración Zonal (3 o más reportes activos en la misma zona)
-            if conteo_zonal.get(clave_zona, 0) >= 3:
+            # RN-01: Concentración zonal (3 o más reportes activos).
+            cantidad_zonal = conteo_zonal.get(clave_zona, 0)
+            if cantidad_zonal >= 3:
                 bono_zonal = 7.0
                 puntaje_final += bono_zonal
                 reglas_aplicadas.append({
                     "codigo": "RN-01",
                     "nombre": "Concentración Zonal",
                     "impacto": f"+{bono_zonal} pts",
-                    "detalle": f"Foco crítico detectado: {conteo_zonal.get(clave_zona)} reportes en {rep.get('distrito')} ({rep.get('zona')})."
+                    "detalle": (
+                        f"Foco crítico detectado: {cantidad_zonal} reportes "
+                        f"en {_texto(rep.get('distrito'), 'distrito')} "
+                        f"({_texto(rep.get('zona'), 'zona')})."
+                    ),
                 })
 
-            # RN-02: Detección de Duplicados / Reportes Reincidentes
+            # RN-02: Coincidencias entre reportes activos.
             coincidentes = grupos_duplicados.get(clave_dup, [])
             if len(coincidentes) > 1:
                 bono_dup = 5.0
                 puntaje_final += bono_dup
                 reglas_aplicadas.append({
                     "codigo": "RN-02",
-                    "nombre": "Reincidencia / Duplicados",
+                    "nombre": "Reincidencia / Reportes Similares",
                     "impacto": f"+{bono_dup} pts",
-                    "detalle": f"Existe coincidencia vecinal con {len(coincidentes)} reportes similares en la misma zona."
+                    "detalle": (
+                        f"Existen {len(coincidentes)} reportes activos con "
+                        "el mismo distrito, zona y categoría."
+                    ),
                 })
 
-            # RN-03: Antigüedad Crítica (> 30 días sin resolver)
-            dias = int(rep.get("tiempo_sin_resolver", 0))
+            # RN-03: Antigüedad crítica (más de 30 días).
             if dias > 30:
                 bono_antiguedad = 8.0
                 puntaje_final += bono_antiguedad
@@ -173,56 +240,69 @@ def calcular_ranking(reportes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     "codigo": "RN-03",
                     "nombre": "Antigüedad Crítica",
                     "impacto": f"+{bono_antiguedad} pts",
-                    "detalle": f"El problema acumula {dias} días sin resolverse (supera el umbral de 30 días)."
+                    "detalle": (
+                        f"El problema acumula {int(dias)} días sin resolverse "
+                        "(supera el umbral de 30 días)."
+                    ),
                 })
 
-            # RN-04: Optimización de Recursos (Quick-Wins de impacto rápido)
-            if rep.get("recursos_requeridos") == "Bajo":
+            # RN-04: Quick-win por requerir pocos recursos.
+            if recursos == "bajo":
                 bono_quickwin = 4.0
                 puntaje_final += bono_quickwin
                 reglas_aplicadas.append({
                     "codigo": "RN-04",
                     "nombre": "Optimización de Recursos",
                     "impacto": f"+{bono_quickwin} pts",
-                    "detalle": "Resolución de bajo costo y alta factibilidad técnica para despacho inmediato."
+                    "detalle": (
+                        "Resolución de bajo costo y alta factibilidad técnica "
+                        "para despacho inmediato."
+                    ),
                 })
 
-            # RN-05: Umbral de Riesgo Extremo
-            gravedad_val = int(rep.get("gravedad", 1))
-            poblacion_val = int(rep.get("poblacion_afectada", 0))
-            categoria_val = rep.get("categoria", "")
-
-            es_emergencia = (gravedad_val == 5 and poblacion_val >= 1000) or (
-                categoria_val in ["Inundaciones", "Fugas de Agua"] and gravedad_val == 5
+            # RN-05: Umbral de riesgo extremo.
+            categoria_normalizada = categoria.casefold()
+            es_emergencia = (
+                (gravedad >= 5 and poblacion >= 1000)
+                or (
+                    categoria_normalizada in ("inundaciones", "fugas de agua")
+                    and gravedad >= 5
+                )
             )
 
             if es_emergencia:
                 if puntaje_final < 85.0:
-                    puntaje_final = max(puntaje_final, 85.0)
-                    impacto_str = "Fijado en mínimo 85 pts"
+                    puntaje_final = 85.0
+                    impacto_emergencia = "Fijado en mínimo 85 pts"
                 else:
                     puntaje_final += 5.0
-                    impacto_str = "+5.0 pts (Emergencia)"
+                    impacto_emergencia = "+5.0 pts (Emergencia)"
 
                 reglas_aplicadas.append({
                     "codigo": "RN-05",
                     "nombre": "Umbral de Riesgo Extremo",
-                    "impacto": impacto_str,
-                    "detalle": "Incidencia de severidad máxima que compromete la seguridad de más de 1,000 personas o servicios vitales."
+                    "impacto": impacto_emergencia,
+                    "detalle": (
+                        "Incidencia de severidad máxima que afecta a una "
+                        "población numerosa o corresponde a una categoría "
+                        "considerada crítica por la regla."
+                    ),
                 })
 
-            # RN-06: Límites de Puntaje (Clamping estricto en [0.0, 100.0])
-            puntaje_acotado = max(0.0, min(100.0, puntaje_final))
-            if puntaje_final != puntaje_acotado:
+            # RN-06: Limitar puntaje al intervalo [0, 100].
+            puntaje_acotado = min(100.0, max(0.0, puntaje_final))
+            if puntaje_acotado != puntaje_final:
                 reglas_aplicadas.append({
                     "codigo": "RN-06",
                     "nombre": "Límites de Puntaje",
                     "impacto": "Acotado [0-100]",
-                    "detalle": "Puntaje ajustado al rango matemático permitido de 0 a 100."
+                    "detalle": (
+                        "Puntaje ajustado al rango permitido de 0 a 100."
+                    ),
                 })
             puntaje_final = puntaje_acotado
 
-            # RN-07: Clasificación por Rangos
+            # RN-07: Clasificación por rangos.
             if puntaje_final >= 80.0:
                 clasificacion = "Crítica"
             elif puntaje_final >= 65.0:
@@ -236,18 +316,24 @@ def calcular_ranking(reportes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "codigo": "RN-07",
                 "nombre": "Clasificación por Rango",
                 "impacto": clasificacion,
-                "detalle": f"Puntaje de {round(puntaje_final, 1)} pts asignado al segmento {clasificacion}."
+                "detalle": (
+                    f"Puntaje de {round(puntaje_final, 1)} pts asignado "
+                    f"al segmento {clasificacion}."
+                ),
             })
 
         else:
-            # RN-08: Gestión de Casos Resueltos
+            # RN-08: Los reportes resueltos quedan inactivos.
             puntaje_final = 0.0
             clasificacion = "Baja"
             reglas_aplicadas.append({
                 "codigo": "RN-08",
                 "nombre": "Caso Resuelto",
                 "impacto": "0 pts (Inactivo)",
-                "detalle": "El reporte ya fue atendido y resuelto. Pasa a histórico sin consumir prioridad activa."
+                "detalle": (
+                    "El reporte ya fue atendido y resuelto. Pasa a histórico "
+                    "sin consumir prioridad activa."
+                ),
             })
 
         rep["puntaje_base"] = round(puntaje_base, 2)
@@ -258,43 +344,48 @@ def calcular_ranking(reportes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "gravedad_pts": round(p_gravedad, 2),
             "poblacion_pts": round(p_poblacion, 2),
             "tiempo_pts": round(p_tiempo, 2),
-            "recursos_pts": round(p_recursos, 2)
+            "recursos_pts": round(p_recursos, 2),
         }
         rep["explicacion"] = generar_explicacion(rep)
-
         reportes_procesados.append(rep)
 
-    # Ordenar ranking de mayor a menor puntaje (los activos primero, resueltos al final)
-    reportes_procesados.sort(key=lambda r: (r["puntaje"], r["gravedad"], r["poblacion_afectada"]), reverse=True)
+    # Los activos siempre aparecen primero; cada grupo se ordena por puntaje.
+    reportes_procesados.sort(
+        key=lambda r: (
+            _estado_resuelto(r),
+            -_numero(r.get("puntaje", 0), 0.0),
+            -_numero(r.get("gravedad", 1), 1.0),
+            -_numero(r.get("poblacion_afectada", 0), 0.0),
+        )
+    )
 
-    # Asignar posición de ranking correlativa
-    for index, rep in enumerate(reportes_procesados, start=1):
-        rep["ranking_posicion"] = index
+    for posicion, rep in enumerate(reportes_procesados, start=1):
+        rep["ranking_posicion"] = posicion
 
     return reportes_procesados
 
 
+# =============================================================================
+# EXPLICACIÓN DEL RESULTADO
+# =============================================================================
 def generar_explicacion(reporte: Dict[str, Any]) -> str:
-    """
-    Genera un informe explicativo legible y técnico justificando el puntaje
-    calculado por el motor de IA para el reporte específico.
-    """
-    if reporte.get("estado") == "Resuelto":
+    """Genera una explicación legible de la prioridad calculada."""
+    if _estado_resuelto(reporte):
         return (
-            "Este reporte se encuentra en estado 'Resuelto'. Conforme a la regla de negocio RN-08, "
-            "la incidencia ya ha recibido intervención operativa y no requiere asignación de nuevos recursos, "
-            "por lo que su puntaje de prioridad activa se ajusta a 0.0 puntos para archivar su histórico."
+            "Este reporte se encuentra en estado 'Resuelto'. Conforme a la "
+            "regla RN-08, la incidencia pasa al histórico y su puntaje de "
+            "prioridad activa se ajusta a 0.0 puntos."
         )
 
-    puntaje = reporte.get("puntaje", 0.0)
-    clasificacion = reporte.get("clasificacion", "Baja")
-    gravedad = reporte.get("gravedad", 1)
-    poblacion = reporte.get("poblacion_afectada", 0)
-    tiempo = reporte.get("tiempo_sin_resolver", 0)
-    recursos = reporte.get("recursos_requeridos", "Medio")
-    categoria = reporte.get("categoria", "Incidencia")
-    distrito = reporte.get("distrito", "el distrito")
-    zona = reporte.get("zona", "la zona")
+    puntaje = _numero(reporte.get("puntaje", 0), 0.0)
+    clasificacion = _texto(reporte.get("clasificacion", "Baja"), "Baja")
+    gravedad = _numero(reporte.get("gravedad", 1), 1.0)
+    poblacion = _numero(reporte.get("poblacion_afectada", 0), 0.0)
+    tiempo = _numero(reporte.get("tiempo_sin_resolver", 0), 0.0)
+    recursos = _texto(reporte.get("recursos_requeridos", "Medio"), "Medio")
+    categoria = _texto(reporte.get("categoria", "Incidencia"), "Incidencia")
+    distrito = _texto(reporte.get("distrito", "el distrito"), "el distrito")
+    zona = _texto(reporte.get("zona", "la zona"), "la zona")
 
     desglose = reporte.get("desglose_ponderado", {})
     p_grav = desglose.get("gravedad_pts", 0.0)
@@ -302,33 +393,46 @@ def generar_explicacion(reporte: Dict[str, Any]) -> str:
     p_tiempo = desglose.get("tiempo_pts", 0.0)
     p_rec = desglose.get("recursos_pts", 0.0)
 
-    # Identificar el factor determinante
-    factores_dict = {
+    factores = {
         "Gravedad": p_grav,
         "Población": p_pob,
         "Tiempo de Espera": p_tiempo,
-        "Viabilidad de Recursos": p_rec
+        "Viabilidad de Recursos": p_rec,
     }
-    factor_mayor = max(factores_dict, key=factores_dict.get)
+    factor_mayor = max(factores, key=factores.get)
 
     reglas = reporte.get("reglas_aplicadas", [])
-    codigos_reglas = [r["codigo"] for r in reglas if r["codigo"] in ["RN-01", "RN-02", "RN-03", "RN-04", "RN-05"]]
-    str_reglas = ", ".join(codigos_reglas) if codigos_reglas else "Ninguna bonificación extraordinaria"
+    codigos_especiales = {"RN-01", "RN-02", "RN-03", "RN-04", "RN-05"}
+    reglas_especiales = [
+        regla for regla in reglas
+        if regla.get("codigo") in codigos_especiales
+    ]
 
     explicacion = (
-        f"El reporte de {categoria} en {distrito} (Zona {zona}) ha sido clasificado con Prioridad {clasificacion.upper()} "
-        f"con un puntaje final de {puntaje} / 100 puntos. "
-        f"El factor más influyente en su evaluación multicriterio fue '{factor_mayor}'. "
-        f"Evaluación específica: Gravedad nivel {gravedad}/5 ({p_grav} pts ponderados), "
-        f"impacto directo sobre {poblacion:,} ciudadanos ({p_pob} pts), "
-        f"tiempo de espera acumulado de {tiempo} días ({p_tiempo} pts) y requerimiento de recursos '{recursos}' ({p_rec} pts). "
+        f"El reporte de {categoria} en {distrito} (Zona {zona}) ha sido "
+        f"clasificado con Prioridad {clasificacion.upper()} con un puntaje "
+        f"final de {puntaje:.2f} / 100 puntos. El factor con mayor aporte "
+        f"ponderado fue '{factor_mayor}'. Evaluación específica: gravedad "
+        f"nivel {gravedad:g}/5 ({p_grav} pts ponderados), impacto directo "
+        f"sobre {poblacion:,.0f} ciudadanos ({p_pob} pts), tiempo de espera "
+        f"de {tiempo:g} días ({p_tiempo} pts) y recursos requeridos "
+        f"'{recursos}' ({p_rec} pts). "
     )
 
-    if codigos_reglas:
-        explicacion += f"Adicionalmente, el motor de IA activó las reglas de negocio especiales ({str_reglas}), "
-        detalles_reglas = [f"{r['codigo']} ({r['nombre']}: {r['impacto']})" for r in reglas if r["codigo"] in codigos_reglas]
-        explicacion += f"incluyendo: {'; '.join(detalles_reglas)}, consolidando su posición en la cuadrilla municipal."
+    if reglas_especiales:
+        codigos = ", ".join(regla["codigo"] for regla in reglas_especiales)
+        detalles = "; ".join(
+            f"{regla['codigo']} ({regla['nombre']}: {regla['impacto']})"
+            for regla in reglas_especiales
+        )
+        explicacion += (
+            f"Se activaron las siguientes reglas especiales ({codigos}): "
+            f"{detalles}."
+        )
     else:
-        explicacion += "No se registraron bonificaciones por emergencias extremas ni reincidencia zonal múltiple."
+        explicacion += (
+            "No se activaron bonificaciones extraordinarias por las reglas "
+            "RN-01 a RN-05."
+        )
 
     return explicacion
